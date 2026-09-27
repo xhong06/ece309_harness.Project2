@@ -18,6 +18,44 @@
 #include <cassert>
 
 
+#include <cstdio>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace {
+
+    // Lightweight InputSource feeding lines from a vector
+    class VectorInputSource : public InputSource {
+    public:
+        explicit VectorInputSource(std::vector<std::string> lines)
+            : lines_(std::move(lines)) {}
+
+        std::string read_line() override {
+            if (index_ >= lines_.size()) {
+                eof_ = true;
+                return "";
+            }
+            return lines_[index_++];
+        }
+
+        bool is_eof() const override { return eof_; }
+
+    private:
+        std::vector<std::string> lines_;
+        std::size_t index_ = 0;
+        bool eof_ = false;
+    };
+
+    // Discards terminal output during test runs
+    class QuietOutputSink : public OutputSink {
+    public:
+        void write(std::string_view /*text*/) override {}
+    };
+
+} // namespace
 
 void handle_empty_conversation() {
     // This test case checks that the Conversation class correctly handles an empty conversation by verifying that size() returns 0 and that accessing an out-of-bounds index throws the expected exception.
@@ -174,16 +212,114 @@ void scanner_false_alarm() {
 
 void scanner_bounded_memory() {
     const std::string sentinel = "<|end_conversation|>";
+    const std::size_t max_allowed_pending = sentinel.size() - 1; // 19 characters
     const std::string text = "<|end_conversa";
     SentinelScanner scanner(sentinel);
-    auto out1 = scanner.feed(text);
-    assert()
+
+    std::size_t input_length = 0; // Create a variable to track the size of the text to be processed by scanner.
+    std::size_t output_length = 0; // Create a variable to track the size of the text outputted by the scanner after being processed for the sentinel.
+
+    for(int i = 0; i < 10000; i++) { // For a long long time...
+        auto out1 = scanner.feed(text); // Feed the close-to-sentinel text into the scanner to check for sentinel.
+        input_length += text.size(); // Increment the total input size by adding the size of the chunk being processed in this cycle of the loop. +14 each loop.
+        output_length += out1.safe_text.size(); // Increment the total output size by adding the size of the bit of the chunk being moved into the safe_text during this cycle of the loop.
+        assert(!out1.sentinel_found && "Expected not to find sentinel in the close-to-sentinel text."); // Check for sentinel.
+
+        std::size_t current_held_bytes = input_length - output_length; // Create a variable to track the size of the chunk in the pending_ instance variable within the SentinelScanner.
+        assert(current_held_bytes <= max_allowed_pending && "Error: Sentinel Scanner held back more bytes in pending_ than sentinel.size() - 1 after breaking apart the chunk.");
+        // Check if the current bytes held in pending ever exceed what is permitted.
+
+    }
+}
+
+void harness_turn_limit() {
+    HarnessConfig exampleConfiguration; // Create an example harness configuration for testing purposes.
+    exampleConfiguration.max_turns = 3; // Since the harness is for testing purposes, we're going to make the max turns very small so that we don't need an enormous amount of messages to test turn-limit.
+    exampleConfiguration.system_message = "You may begin anytime";
+
+    VectorInputSource input({"User input 1", "User input 2", "User input 3", "User input 4"});
+    QuietOutputSink output;
+
+    auto model = std::make_unique<ScriptedModelClient>("sample_input10.txt");
+
+    Harness harness(std::move(model), exampleConfiguration);
+
+    StopReason result = harness.run(input, output);
+    assert(result.kind == StopReason::Kind::TurnLimit && "Expected to be stopped because max_turns is reached");
+    // Check to see if Stop-reason is because of turn-limit.
+
+    const Conversation& conv = harness.conversation();
+    assert(conv.size() == 5 && "Conversation size must equal 5 messages");
+
+    assert(conv.at(0).role() == Role::System);
+    assert(conv.at(1).role() == Role::User && conv.at(1).content() == "User input 1");
+    assert(conv.at(2).role() == Role::Assistant && conv.at(2).content() == "First assistant reply");
+    assert(conv.at(3).role() == Role::User && conv.at(3).content() == "User input 2");
+    assert(conv.at(4).role() == Role::Assistant && conv.at(4).content() == "Second assistant reply");
+    
+}
+
+void harness_sentinel_halt() {
+    HarnessConfig exampleConfiguration;
+    exampleConfiguration.max_turns = 10;
+
+    VectorInputSource input({"User input 1", "User input 2", "User input 3"});
+    QuietOutputSink output;
+
+    auto model = std::make_unique<ScriptedModelClient>("sample_input11.txt");
+    Harness harness(std::move(model), exampleConfiguration);
+
+    StopReason result = harness.run(input, output);
+    assert(result.kind == StopReason::Kind::Sentinel && "Expected to be stopped because sentinel is identified");
+    // Check to see if Stop-reason is because of Sentinel.
+
+    const Conversation& conv = harness.conversation();
+    assert(conv.size() == 4 && "Conversation must contain 2 User and 2 Assistant messages");
+
+    assert(conv.at(3).role() == Role::Assistant);
+    assert(conv.at(3).content() == "This is turn two.<|end_conversation|>" &&
+           "Stored assistant message must include the sentinel and strip anything trailing it");
+}
+
+void transcript_round_trip() {
+    auto model = std::make_unique<ReplayModelClient>("sample_input12.txt");
+    HarnessConfig exampleConfiguration;
+    exampleConfiguration.max_turns = 5;
+    exampleConfiguration.system_message = "You may begin anytime";
+
+    VectorInputSource input({"Prompt 1", "Prompt 2", "Prompt 3"});
+    QuietOutputSink output;
+
+    Harness harness(std::move(model), exampleConfiguration);
+    StopReason result = harness.run(input, output);
+    assert(result.kind == StopReason::Kind::Sentinel && "Expected to be stopped because sentinel is identified while replaying transcript");
+
+    const Conversation& conv = harness.conversation();
+    assert(conv.size() == 5 && "Replayed conversation must contain 5 total messages");
+
+    assert(conv.at(0).role() == Role::System && 
+           conv.at(0).content() == "You are a deterministic replay bot.");
+    
+    assert(conv.at(1).role() == Role::User && conv.at(1).content() == "Prompt 1");
+    assert(conv.at(2).role() == Role::Assistant && conv.at(2).content() == "Replayed reply 1");
+    
+    assert(conv.at(3).role() == Role::User && conv.at(3).content() == "Prompt 2");
+    assert(conv.at(4).role() == Role::Assistant && conv.at(4).content() == "Replayed reply 2<|end_conversation|>");
 }
 
 
 int main() {
-    
-    
+    handle_empty_conversation();
+    system_message_ordering();
+    rule_of_five_copy();
+    rule_of_five_move();
+    growth_behavior();
+    scanner_clean_text();
+    scanner_catches_sentinel_at_every_boundary();
+    scanner_false_alarm();
+    scanner_bounded_memory();
+    harness_turn_limit();
+    harness_sentinel_halt();
+    transcript_round_trip();
 
-    
 }
